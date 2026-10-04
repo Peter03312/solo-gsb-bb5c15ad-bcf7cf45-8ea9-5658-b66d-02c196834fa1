@@ -1,11 +1,15 @@
 """SQLite 存储层。
 
 一致性要点：
-- 所有"读-改-写"（标注修订号 check-and-set、发布）都在
+- 所有"读-改-写"（标注修订号 check-and-set、单份发布、批次发布）都在
   ``BEGIN IMMEDIATE`` 事务内完成，SQLite 写锁将其串行化，
-  因此发布读到的标注修订与写入记录的修订必然一致。
+  因此发布读到的标注修订与写入记录的修订必然一致；批次内多文档同样与
+  并发的标注修改、单份发布、其他批次发布互斥。
 - 标注矩形按 (doc_id, revision) 追加存储、永不改写，
   已发布成品对应的遮盖坐标因此不可变。
+- 批次记录（publication_batches/batch_publications）与各文档 publications
+  行在同一事务内提交：任一文档校验或渲染失败即整体回滚，批次下不会留下
+  任何版本记录或批次号，也就不存在被占用的版本号。
 """
 from __future__ import annotations
 
@@ -46,15 +50,39 @@ CREATE TABLE IF NOT EXISTS publications (
     output_sha256       TEXT NOT NULL,
     output_path         TEXT NOT NULL,
     created_at          TEXT NOT NULL,
+    batch_id            TEXT,
     PRIMARY KEY (doc_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS publication_batches (
+    id         TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_publications (
+    batch_id            TEXT NOT NULL REFERENCES publication_batches(id),
+    position            INTEGER NOT NULL,   -- 请求中的次序，从 0 开始
+    doc_id              TEXT NOT NULL REFERENCES documents(id),
+    version             INTEGER NOT NULL,
+    annotation_revision INTEGER NOT NULL,
+    original_sha256     TEXT NOT NULL,
+    output_sha256       TEXT NOT NULL,
+    PRIMARY KEY (batch_id, position),
+    UNIQUE (doc_id, version),
+    FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
 );
 """
 
 
 def init_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     try:
         conn.executescript(SCHEMA)
+        # 轻量迁移：旧卷上的 publications 表可能没有 batch_id 列
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(publications)")}
+        if "batch_id" not in cols:
+            conn.execute("ALTER TABLE publications ADD COLUMN batch_id TEXT")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     finally:

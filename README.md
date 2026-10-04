@@ -53,6 +53,8 @@ python -m pytest tests/ -q
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
 | POST | `/documents/{doc_id}/publish` | 按当前标注发布新版本（涂实+去元数据 PNG） |
 | GET  | `/documents/{doc_id}/publications` | 发布版本列表 |
+| POST | `/publication-batches` | **同批次发布 2～20 份文档**（原子：全成功或整批失败） |
+| GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致） |
 | GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因 |
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG |
 
@@ -82,7 +84,69 @@ curl -s $BASE/publications/$DOC_ID/1          # 版本元数据 + 遮盖坐标/�
 curl -s -OJ $BASE/publications/$DOC_ID/1/image # 发布版 PNG
 ```
 
-完整可运行脚本：`examples/demo.sh`（先启动服务，再执行 `bash examples/demo.sh`）。
+完整可运行脚本：`examples/demo.sh`（单份流程）与 `examples/demo_batch.sh`
+（批次发布流程）；先启动服务，再执行 `bash examples/demo_batch.sh`。
+
+## 同批次发布（2～20 份，整批原子）
+
+档案员把一批**已标注**影像作为同一批次公开。请求携带 2～20 个**不同**文档 ID
+及各自**预期标注修订号**：仅当全部文档都存在、且预期修订号仍与服务端当前修订号
+匹配时，才在同一写事务内为每份文档按当前标注生成去元数据、纯黑涂实的独立发布版。
+任一文档无效、修订过期、原图无法读取或成品写入失败，**整批失败**：不留下任何可
+公开的部分版本，不占用任何版本号，也不生成批次标识。批次内渲染与落盘与同时发生
+的标注修改、单份发布、其他批次发布互斥串行；已发布版本仍不可变，单份发布与公开
+读取的响应及行为保持兼容（批次产物与单份产物共用同一张 `publications` 表、
+同一个 `/publications/...` 公开入口）。
+
+```bash
+BASE=http://localhost:8000
+curl -sS -X POST $BASE/publication-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "documents": [
+      {"doc_id": "DOC_ID_1", "expected_revision": 1},
+      {"doc_id": "DOC_ID_2", "expected_revision": 1},
+      {"doc_id": "DOC_ID_3", "expected_revision": 0}
+    ]
+  }'
+```
+
+成功 `201`：返回批次标识、创建时间，以及按**请求顺序**排列的各文档结果
+（版本、固化的标注修订号、原图/成品摘要、遮盖数量）：
+
+```json
+{
+  "batch_id": "7bc8e9008700469fb1c896990b34e620",
+  "created_at": "2026-10-04T19:18:21+00:00",
+  "count": 3,
+  "documents": [
+    {"position": 0, "doc_id": "DOC_ID_1", "version": 1,
+     "annotation_revision": 1, "original_sha256": "…",
+     "output_sha256": "…", "redaction_count": 1, "created_at": "…"},
+    {"position": 1, "doc_id": "DOC_ID_2", "version": 1, "…": "…"},
+    {"position": 2, "doc_id": "DOC_ID_3", "version": 1, "…": "…"}
+  ]
+}
+```
+
+按批次标识查询（清单顺序与原请求一致）：
+
+```bash
+curl -sS $BASE/publication-batches/7bc8e9008700469fb1c896990b34e620
+```
+
+每份文档的版本号仍在该文档维度内按 `MAX(version)+1` 连续分配，与单份发布
+共用序列（先发过 v1 的文档，在成功批次里拿到 v2）。失败响应在统一错误体外
+附带可定位信息：`position`（请求中的下标，从 0 起）、`doc_id`，修订过期时
+还附 `current_revision`/`supplied_revision`：
+
+```bash
+# HTTP 409
+# {"detail":{"code":"stale_revision","message":"…",
+#   "position":1,"doc_id":"DOC_ID_2",
+#   "current_revision":2,"supplied_revision":1}}
+```
+
 
 ## 错误响应
 
@@ -95,9 +159,14 @@ curl -s -OJ $BASE/publications/$DOC_ID/1/image # 发布版 PNG
 | 400 | `empty_rectangle` | 矩形宽或高 ≤ 0 |
 | 400 | `rectangle_out_of_bounds` | 矩形越出旋正后图像边界 |
 | 400 | `reason_required` | 矩形未填写原因 |
-| 404 | `document_not_found` | 文档不存在 |
+| 404 | `document_not_found` | 文档不存在（批次场景附 `position`/`doc_id`） |
 | 404 | `unknown_version` | 发布版本不存在 |
-| 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`） |
+| 404 | `batch_not_found` | 批次标识不存在 |
+| 400 | `invalid_batch_size` | 批次文档数不在 2～20（附 `count`） |
+| 400 | `duplicate_document_in_batch` | 批次内文档 ID 重复（附 `position`/`doc_id`） |
+| 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次场景另附 `position`/`doc_id`/`supplied_revision`） |
+| 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
+| 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
 | 413 | `payload_too_large` | 超过上传大小上限 |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
 
@@ -109,8 +178,15 @@ curl -s -OJ $BASE/publications/$DOC_ID/1/image # 发布版 PNG
   在 `BEGIN IMMEDIATE` 事务内 check-and-set，过期即 409，不会丢失他人修改。
 - **发布事务**：读取当前修订号与矩形、渲染涂实、写盘、插入发布记录在同一写事务中完成；
   与标注修改互斥串行，因此成品文件与记录必然对应同一修订。
+- **批次原子性**：`POST /publication-batches` 在**一个** `BEGIN IMMEDIATE` 事务内
+  按请求顺序先完成全部"存在性 + 修订号"校验，全部通过后才逐份渲染落盘并登记
+  `publications`/`publication_batches`/`batch_publications`；与标注修改、单份发布、
+  其他批次发布互斥。任一文档不存在、修订号过期、原图不可读、成品写盘失败，事务整体
+  回滚并清理已落盘文件——既不产生批次标识，也没有任何 `publications` 行，因此
+  `MAX(version)+1` 不会被失败批次推进（不占版本号、不留部分版本）。成功批次的每份
+  版本与单份发布共用 `publications` 序列；批次清单以 `position` 固化请求次序。
 - **不可变性**：标注矩形按 `(doc_id, revision)` 追加存储、历史修订永不改写；
-  发布版 PNG 落盘后不改动，后续标注变化不影响已发布成品。
+  发布版 PNG 落盘后不改动，后续标注变化不影响已发布成品（批次产物同样如此）。
 - **脱敏**：矩形区域以纯黑不可逆涂实；发布图重建为干净像素容器后另存为 PNG，
   不携带 EXIF/ICC/文本等任何原图元数据；无标注时也生成去元数据的发布版。
 - **公开面**：`/publications/...` 只返回发布版成品、遮盖坐标与原因及摘要值，
@@ -123,9 +199,24 @@ app/
   main.py     # FastAPI 路由与事务编排
   db.py       # SQLite 模式与事务助手（WAL + BEGIN IMMEDIATE）
   imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染
-  models.py   # 请求体模型
+  models.py   # 请求体模型（含批次请求）
   config.py   # 环境变量配置
-tests/test_api.py  # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
-examples/demo.sh   # 端到端 curl 示例
+tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
+tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
+                     #   原图不可读/写盘失败的整批回滚、版本交错、不可变性、并发
+examples/demo.sh         # 单份端到端 curl 示例
+examples/demo_batch.sh   # 批次发布端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
+
+## 本轮变动（同批次发布）
+
+- 新增 `POST /publication-batches`（2～20 份不同文档、各带预期修订号，整批原子）
+  与 `GET /publication-batches/{batch_id}`（按批次标识查询，顺序与请求一致）。
+- 新增表 `publication_batches`、`batch_publications`，并在 `publications` 增加
+  可空列 `batch_id`；旧数据卷启动时自动补列（`ALTER TABLE` 轻量迁移）。
+- 新增错误码：`invalid_batch_size`、`duplicate_document_in_batch`、
+  `batch_not_found`、`original_unavailable`、`artifact_write_failed`；批次场景的
+  `document_not_found`/`stale_revision` 附 `position`、`doc_id` 等定位字段。
+- 既有单份发布、公开读取的路由、请求与响应字段均未改动，行为完全兼容；
+  批次产物与单份产物共用版本序列与公开入口，已发布版本依旧不可变。

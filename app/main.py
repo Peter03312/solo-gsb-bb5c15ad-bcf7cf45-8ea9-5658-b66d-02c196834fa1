@@ -20,7 +20,7 @@ from .imaging import (
     load_oriented,
     render_publication,
 )
-from .models import AnnotationsPut
+from .models import AnnotationsPut, BatchPublishRequest
 
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg"}
 
@@ -339,6 +339,213 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 (doc_id,),
             ).fetchall()
         return {"doc_id": doc_id, "publications": [dict(p) for p in pubs]}
+
+    # ---------------- 批次发布（整批原子） ----------------
+
+    @app.post("/publication-batches", status_code=201)
+    def publish_batch(body: BatchPublishRequest) -> dict:
+        items = body.documents
+        # 语义校验：数量与重复在进入事务前拒绝（不涉及版本号分配）
+        if not 2 <= len(items) <= 20:
+            _error(
+                400,
+                "invalid_batch_size",
+                f"batch must contain between 2 and 20 documents, got {len(items)}",
+                count=len(items),
+            )
+        seen: set[str] = set()
+        for pos, item in enumerate(items):
+            if item.doc_id in seen:
+                _error(
+                    400,
+                    "duplicate_document_in_batch",
+                    f"document '{item.doc_id}' appears more than once in the batch",
+                    position=pos,
+                    doc_id=item.doc_id,
+                )
+            seen.add(item.doc_id)
+
+        batch_id = uuid.uuid4().hex
+        now = _utcnow()
+        written_paths: list[str] = []
+        # 整批校验 + 渲染 + 落盘 + 记录全部在同一个 BEGIN IMMEDIATE 事务中，
+        # 与标注修改、单份发布、其他批次发布互斥串行；
+        # 任一项失败即回滚全部 INSERT，并清理已落盘文件，不留下可公开的
+        # 部分版本，MAX(version)+1 也不会被失败批次推进（记录从未提交）。
+        try:
+            with write_tx(settings.db_path) as conn:
+                # 第一阶段：按请求顺序逐份校验（存在性 + 修订号匹配），
+                # 先定位失败项，再渲染任何成品。
+                prepared: list[tuple[Any, int, Any]] = []
+                for pos, item in enumerate(items):
+                    doc = conn.execute(
+                        "SELECT * FROM documents WHERE id = ?", (item.doc_id,)
+                    ).fetchone()
+                    if doc is None:
+                        _error(
+                            404,
+                            "document_not_found",
+                            f"document '{item.doc_id}' does not exist",
+                            position=pos,
+                            doc_id=item.doc_id,
+                        )
+                    revision = doc["annotation_revision"]
+                    if item.expected_revision != revision:
+                        _error(
+                            409,
+                            "stale_revision",
+                            f"annotation revision mismatch for '{item.doc_id}':"
+                            f" expected {revision}, got {item.expected_revision};"
+                            " re-fetch and retry",
+                            position=pos,
+                            doc_id=item.doc_id,
+                            current_revision=revision,
+                            supplied_revision=item.expected_revision,
+                        )
+                    rects = conn.execute(
+                        "SELECT x, y, w, h, reason FROM annotation_rects"
+                        " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                        (doc["id"], revision),
+                    ).fetchall()
+                    version = conn.execute(
+                        "SELECT COALESCE(MAX(version), 0) + 1 AS v"
+                        " FROM publications WHERE doc_id = ?",
+                        (doc["id"],),
+                    ).fetchone()["v"]
+                    prepared.append((doc, version, revision, rects))
+
+                # 第二阶段：全部校验通过后逐份渲染、落盘、登记
+                result_items: list[dict] = []
+                for pos, (doc, version, revision, rects) in enumerate(prepared):
+                    try:
+                        with open(doc["original_path"], "rb") as f:
+                            original_bytes = f.read()
+                        oriented, _ = load_oriented(original_bytes)
+                    except Exception as exc:
+                        _error(
+                            500,
+                            "original_unavailable",
+                            f"stored original for '{doc['id']}' cannot be decoded:"
+                            f" {exc}",
+                            position=pos,
+                            doc_id=doc["id"],
+                        )
+
+                    image = render_publication(oriented, rects)
+                    doc_pub_dir = os.path.join(settings.publications_dir, doc["id"])
+                    output_path = os.path.abspath(
+                        os.path.join(doc_pub_dir, f"v{version}.png")
+                    )
+                    try:
+                        os.makedirs(doc_pub_dir, exist_ok=True)
+                        image.save(output_path, format="PNG")  # 无元数据独立 PNG
+                        output_sha256 = _sha256_file(output_path)
+                    except Exception as exc:
+                        # 成品写入失败：清理可能已部分写入的文件
+                        if os.path.exists(output_path):
+                            try:
+                                os.unlink(output_path)
+                            except OSError:
+                                pass
+                        _error(
+                            500,
+                            "artifact_write_failed",
+                            f"failed to write publication artifact for"
+                            f" '{doc['id']}' version {version}: {exc}",
+                            position=pos,
+                            doc_id=doc["id"],
+                            version=version,
+                        )
+                    written_paths.append(output_path)
+
+                    conn.execute(
+                        "INSERT INTO publications (doc_id, version, annotation_revision,"
+                        " original_sha256, output_sha256, output_path, created_at,"
+                        " batch_id) VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            doc["id"],
+                            version,
+                            revision,
+                            doc["original_sha256"],
+                            output_sha256,
+                            output_path,
+                            now,
+                            batch_id,
+                        ),
+                    )
+                    result_items.append(
+                        {
+                            "position": pos,
+                            "doc_id": doc["id"],
+                            "version": version,
+                            "annotation_revision": revision,
+                            "original_sha256": doc["original_sha256"],
+                            "output_sha256": output_sha256,
+                            "redaction_count": len(rects),
+                            "created_at": now,
+                        }
+                    )
+
+                conn.execute(
+                    "INSERT INTO publication_batches (id, created_at) VALUES (?,?)",
+                    (batch_id, now),
+                )
+                for out in result_items:
+                    conn.execute(
+                        "INSERT INTO batch_publications (batch_id, position, doc_id,"
+                        " version, annotation_revision, original_sha256, output_sha256)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (
+                            batch_id,
+                            out["position"],
+                            out["doc_id"],
+                            out["version"],
+                            out["annotation_revision"],
+                            out["original_sha256"],
+                            out["output_sha256"],
+                        ),
+                    )
+        except Exception:
+            # 事务回滚（不留下任何批次/版本记录），并清理已落盘半成品
+            for path in written_paths:
+                if os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+            raise
+        return {
+            "batch_id": batch_id,
+            "created_at": now,
+            "count": len(result_items),
+            "documents": result_items,  # 顺序与请求一致
+        }
+
+    @app.get("/publication-batches/{batch_id}")
+    def get_publication_batch(batch_id: str) -> dict:
+        with read_tx(settings.db_path) as conn:
+            batch = conn.execute(
+                "SELECT id, created_at FROM publication_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                _error(
+                    404,
+                    "batch_not_found",
+                    f"publication batch '{batch_id}' does not exist",
+                )
+            rows = conn.execute(
+                "SELECT position, doc_id, version, annotation_revision,"
+                " original_sha256, output_sha256"
+                " FROM batch_publications WHERE batch_id = ? ORDER BY position",
+                (batch_id,),
+            ).fetchall()
+        return {
+            "batch_id": batch["id"],
+            "created_at": batch["created_at"],
+            "count": len(rows),
+            "documents": [dict(r) for r in rows],  # 顺序与原请求一致
+        }
 
     # ---------------- 公开读取（只暴露发布版，不暴露原图） ----------------
 
