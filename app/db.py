@@ -1,11 +1,15 @@
 """SQLite 存储层。
 
 一致性要点：
-- 所有"读-改-写"（标注修订号 check-and-set、发布）都在
+- 所有"读-改-写"（标注修订号 check-and-set、单份发布、批次发布）都在
   ``BEGIN IMMEDIATE`` 事务内完成，SQLite 写锁将其串行化，
-  因此发布读到的标注修订与写入记录的修订必然一致。
+  因此发布读到的标注修订与写入记录的修订必然一致；批次整体
+  与标注修改、单份发布及其他批次发布互斥，全成或全败。
 - 标注矩形按 (doc_id, revision) 追加存储、永不改写，
   已发布成品对应的遮盖坐标因此不可变。
+- 批次发布为每份文档各插一条 publications 记录（批次内版本号互不占用），
+  并由 publication_batch_items 按请求顺序 position 关联；批次事务回滚时
+  这些记录一并消失，不留半成品、不占用版本号。
 """
 from __future__ import annotations
 
@@ -47,6 +51,21 @@ CREATE TABLE IF NOT EXISTS publications (
     output_path         TEXT NOT NULL,
     created_at          TEXT NOT NULL,
     PRIMARY KEY (doc_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS publication_batches (
+    id         TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publication_batch_items (
+    batch_id TEXT NOT NULL REFERENCES publication_batches(id),
+    doc_id   TEXT NOT NULL,
+    version  INTEGER NOT NULL,
+    position INTEGER NOT NULL,          -- 在请求中的下标（从 0 开始），查询即按此排序
+    PRIMARY KEY (batch_id, doc_id),
+    UNIQUE (doc_id, version),
+    FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
 );
 """
 
